@@ -6,6 +6,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.tensor import DTensor
+import torch.cuda.nvtx as nvtx
 
 from ._fsdp_common import (
     _get_dim0_padded_size,
@@ -177,7 +178,9 @@ def foreach_all_gather(
             group=group,
             async_op=async_op,
         )
-        all_gather_event = all_gather_stream.record_event()
+        all_gather_event = torch.cuda.Event(enable_timing=True)
+        nvtx.mark("all-gather event record")
+        all_gather_stream.record_event(all_gather_event)
         return AllGatherResult(
             all_gather_output,
             all_gather_event,
@@ -413,7 +416,9 @@ def foreach_reduce(
             group=reduce_scatter_group,
             op=reduce_scatter_reduce_op,
         )
-        reduce_scatter_event = reduce_scatter_stream.record_event()
+        reduce_scatter_event = torch.cuda.Event(enable_timing=True)
+        nvtx.mark("reduce-scatter event record")
+        reduce_scatter_stream.record_event(reduce_scatter_event)
         post_reduce_stream = reduce_scatter_stream
         if all_reduce_group is not None:  # HSDP
             # Accumulations must run in the reduce-scatter stream

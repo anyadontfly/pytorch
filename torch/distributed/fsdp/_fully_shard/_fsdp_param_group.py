@@ -1,7 +1,8 @@
 # mypy: allow-untyped-defs
 import contextlib
 import logging
-from typing import Any, Callable, cast, NamedTuple, Optional
+from typing import Any, Callable, cast, DefaultDict, NamedTuple, Optional
+from collections import defaultdict
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,7 @@ from torch.distributed.tensor import Shard
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from torch.utils.hooks import RemovableHandle
+import torch.cuda.nvtx as nvtx
 
 from ._fsdp_api import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from ._fsdp_collectives import (
@@ -79,6 +81,11 @@ class FSDPCommContext:
         # Post-forward order for explicit backward prefetching
         self.post_forward_order: list[FSDPParamGroup] = []  # will cause ref cycles
 
+        # Layer lifespan events
+        self.fwd_lifespan_events: DefaultDict[str, list[torch.Event]] = defaultdict(list)
+        self.bwd_lifespan_events: DefaultDict[str, list[torch.Event]] = defaultdict(list)
+        self.root_lifespan_events: DefaultDict[str, list[torch.Event]] = defaultdict(list)
+
     def get_all_gather_streams(
         self, async_op: bool, training_state: TrainingState
     ) -> tuple[torch.Stream, torch.Stream]:
@@ -118,6 +125,7 @@ class FSDPParamGroup:
         self,
         params: list[nn.Parameter],
         modules: tuple[nn.Module, ...],
+        name: str,
         mesh_info: FSDPMeshInfo,
         post_forward_mesh_info: Optional[FSDPMeshInfo],
         device: torch.device,
@@ -127,6 +135,7 @@ class FSDPParamGroup:
     ):
         self.modules = modules  # permit ref cycle because 1:1 lifetime
         param_module_infos = _get_param_module_infos(params, modules)
+        self.name = name
 
         self.fsdp_params = [
             FSDPParam(
@@ -272,6 +281,24 @@ class FSDPParamGroup:
                 *self.comm_ctx.get_all_gather_streams(async_op, self._training_state),
                 self.device,
             )
+            if self._training_state == TrainingState.FORWARD:
+                if not self._reshard_after_forward:
+                    self.comm_ctx.root_lifespan_events[self.name].append(
+                        self._all_gather_result.all_gather_event
+                    )
+                else:
+                    self.comm_ctx.fwd_lifespan_events[self.name].append(
+                        self._all_gather_result.all_gather_event
+                    )
+            elif self._training_state == TrainingState.PRE_BACKWARD:
+                if not self._reshard_after_forward:
+                    self.comm_ctx.root_lifespan_events[self.name].append(
+                        self._all_gather_result.all_gather_event
+                    )
+                else:
+                    self.comm_ctx.bwd_lifespan_events[self.name].append(
+                        self._all_gather_result.all_gather_event
+                    )
 
     def wait_for_unshard(self):
         """
@@ -327,6 +354,16 @@ class FSDPParamGroup:
                 if self._reshard_after_forward_event is not None:
                     self._reshard_after_forward_event.record()
                 return
+        
+        reshard_event = torch.cuda.Event(enable_timing=True)
+        nvtx.mark("reshard event record")
+        reshard_event.record()
+        if not self._reshard_after_forward:
+            self.comm_ctx.root_lifespan_events[self.name].append(reshard_event)
+        elif self._training_state == TrainingState.FORWARD:
+            self.comm_ctx.fwd_lifespan_events[self.name].append(reshard_event)
+        elif self._training_state == TrainingState.POST_BACKWARD:
+            self.comm_ctx.bwd_lifespan_events[self.name].append(reshard_event)
         self._to_sharded()
 
     def pre_forward(
@@ -457,6 +494,14 @@ class FSDPParamGroup:
             self.comm_ctx.reduce_scatter_state = ReduceScatterState(
                 reduce_scatter_input, reduce_scatter_event
             )
+            if not self._reshard_after_forward:
+                self.comm_ctx.root_lifespan_events[self.name].append(
+                    reduce_scatter_event
+                )
+            else:
+                self.comm_ctx.bwd_lifespan_events[self.name].append(
+                    reduce_scatter_event
+                )
             if all_reduce_input is not None:
                 assert all_reduce_event is not None
                 self._all_reduce_state = AllReduceState(

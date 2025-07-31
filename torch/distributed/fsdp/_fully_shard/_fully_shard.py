@@ -84,6 +84,7 @@ def fully_shard(
 @contract(state_cls=FSDPState)  # type: ignore[misc] # see [1]
 def fully_shard(
     module,
+    name,
     *,
     mesh: Optional[DeviceMesh] = None,
     reshard_after_forward: Union[bool, int] = True,
@@ -217,6 +218,7 @@ def fully_shard(
         state._fsdp_param_group = FSDPParamGroup(
             params,
             modules,
+            name,
             mesh_info,
             post_forward_mesh_info,
             device,

@@ -117,6 +117,7 @@ class FSDPState(_State):
         if not compiled_autograd_enabled():
             logger.debug("FSDP::root_pre_forward")
         self._state_ctx.iter_forward_root = self
+        self._fsdp_param_group._is_root_module = True
         with torch.profiler.record_function("FSDP::root_pre_forward"):
             # Wait for optimizer before implicitly prefetched all-gathers
             if (event := self._state_ctx.post_optim_event) is not None:
@@ -298,6 +299,28 @@ class FSDPState(_State):
                     )
                     self._comm_ctx.reduce_scatter_state = None
             self._state_ctx.post_backward_final_callback_queued = False
+
+            # torch.cuda.synchronize()
+            def _sync_on_event(event: torch.Event):
+                if event is not None:
+                    event.synchronize()
+            _print_rank = torch.distributed.get_rank() == 0
+            for name, events in self._comm_ctx.fwd_lifespan_events.items():
+                if _print_rank:
+                    _sync_on_event(events[1])
+                    print(f"Layer {name} fwd params lifespan: {events[0].elapsed_time(events[1])} ms")
+            for name, events in self._comm_ctx.bwd_lifespan_events.items():
+                if _print_rank:
+                    _sync_on_event(events[2])
+                    print(f"Layer {name} bwd params lifespan: {events[0].elapsed_time(events[1])} ms, grads lifespan: {events[0].elapsed_time(events[2])} ms")
+            for name, events in self._comm_ctx.root_lifespan_events.items():
+                if _print_rank:
+                    _sync_on_event(events[2])
+                    print(f"Layer {name} params lifespan: {events[0].elapsed_time(events[1])} ms, grads lifespan: {events[0].elapsed_time(events[2])} ms")
+            if _print_rank:
+                print("===")
+            self._comm_ctx.fwd_lifespan_events.clear()
+            self._comm_ctx.bwd_lifespan_events.clear()
 
     def _finalize_backward(self) -> None:
         if self._modules_to_run_forward:
