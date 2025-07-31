@@ -464,6 +464,9 @@ def _init_core_state(
         forward_prefetch_limit,
     )
     state._unshard_event = None
+
+    state.lifespan_events = []
+
     # Mapping from fully sharded module to the handles it is responsible to
     # unshard and reshard (see [Note: Fully Sharded Module])
     _fully_sharded_module_to_handle: dict[nn.Module, FlatParamHandle] = {}

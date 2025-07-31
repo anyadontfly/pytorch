@@ -38,6 +38,7 @@ from torch.distributed.utils import (
     _to_kwargs,
 )
 from torch.utils import _pytree as pytree
+import torch.cuda.nvtx as nvtx
 
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,11 @@ def _unshard(
     with state._device_handle.stream(unshard_stream):
         handle.unshard()
         handle.post_unshard()
+        
+    unshard_event = torch.cuda.Event(enable_timing=True)
+    nvtx.mark("unshard")
+    unshard_event.record()
+    state.lifespan_events.append(unshard_event)
 
 
 @no_type_check
@@ -313,6 +319,12 @@ def _reshard(
     free the handle's padded unsharded flat parameter.
     """
     handle.reshard(free_unsharded_flat_param)
+
+    reshard_event = torch.cuda.Event(enable_timing=True)
+    nvtx.mark("reshard")
+    reshard_event.record()
+    state.lifespan_events.append(reshard_event)
+
     if state.limit_all_gathers and free_unsharded_flat_param:
         if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
             # We don't run a even queue for freeing under torch compile atm
@@ -856,6 +868,12 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
             padded_unsharded_grad,
             group=pg,
         )
+
+        reduce_grads_event = torch.cuda.Event(enable_timing=True)
+        nvtx.mark("reduce-scatter")
+        reduce_grads_event.record()
+        state.lifespan_events.append(reduce_grads_event)
+
         if uses_hybrid_sharded_strategy:
             # Don't wait during trace
             if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
@@ -1107,11 +1125,14 @@ def _post_backward_final_callback(
             state._device_handle.current_stream().synchronize()
     root_state._exec_order_data.next_iter()
 
-    for fsdp_state in state._all_fsdp_states:
+    lifespan_dict = {}
+
+    for i, fsdp_state in enumerate(state._all_fsdp_states):
         _catch_all_reshard(fsdp_state)
         _finalize_params(fsdp_state)
         fsdp_state.training_state = TrainingState.IDLE
         handle = fsdp_state._handle
+        lifespan_dict[i] = fsdp_state.lifespan_events
         if handle:
             handle._ran_pre_backward_hook = False
             handle._needs_pre_backward_unshard = False
@@ -1120,6 +1141,17 @@ def _post_backward_final_callback(
             handle._prefetched = False
     # Reset for cases like one forward and multiple backwards
     root_state._post_backward_callback_queued = False
+
+    print_rank = dist.get_rank() == 0
+    for i, events in lifespan_dict.items():
+        events[-1].synchronize()
+        if print_rank and len(events) >= 5:
+            print(f"Layer {i} fwd params lifespan: {events[0].elapsed_time(events[1])} ms\n"
+                  f"bwd params lifespan: {events[2].elapsed_time(events[3])} ms\n"
+                  f"bwd grads lifespan: {events[2].elapsed_time(events[4])} ms\n")
+
+    for fsdp_state in state._all_fsdp_states:
+        fsdp_state.lifespan_events.clear()
 
 
 @no_type_check
